@@ -34,8 +34,44 @@ pub fn temp_dir(tag: &str) -> PathBuf {
     d
 }
 
+/// `(bits, group)` formats for a model whose weights sit exactly on a quantization grid.
+#[derive(Clone, Copy)]
+pub struct Grid {
+    pub body: (u8, usize),
+    pub embed: (u8, usize),
+}
+
+/// Weights that are exactly `code * 2^-k` with integer codes, and with the largest code in
+/// every group pinned at the maximum. Such a model is representable in bf16 *and* in the
+/// quantized format without any rounding, so the two must compute the same thing.
+fn grid_bytes(rng: &mut Lcg, rows: usize, cols: usize, bits: u8, group: usize) -> Vec<u8> {
+    let (qmax, scale) = if bits == 8 { (127i32, 2f32.powi(-10)) } else { (7i32, 2f32.powi(-6)) };
+    let mut vals = Vec::with_capacity(rows * cols);
+    for _ in 0..rows {
+        for g in 0..cols / group {
+            for j in 0..group {
+                let mut code = ((rng.next() * (qmax as f32 + 0.5)).round() as i32).clamp(-qmax, qmax);
+                if j == (g * 7) % group {
+                    code = if rng.next() < 0.0 { -qmax } else { qmax };
+                }
+                vals.push(code as f32 * scale);
+            }
+        }
+    }
+    bf16_bytes(vals.into_iter())
+}
+
 /// Write `config.json` and `model.safetensors` for a tiny model into `dir`.
 pub fn write_tiny_model(dir: &Path, seed: u64) {
+    write_model(dir, seed, None);
+}
+
+/// Like [`write_tiny_model`], but every weight matrix lies exactly on the given grid.
+pub fn write_tiny_grid_model(dir: &Path, seed: u64, grid: Grid) {
+    write_model(dir, seed, Some(grid));
+}
+
+fn write_model(dir: &Path, seed: u64, grid: Option<Grid>) {
     let kv = KV_HEADS * (HIDDEN / HEADS);
     let config = format!(
         r#"{{"model_type":"qwen2","hidden_act":"silu","tie_word_embeddings":true,"hidden_size":{HIDDEN},
@@ -76,6 +112,9 @@ pub fn write_tiny_model(dir: &Path, seed: u64) {
         let is_norm = name.ends_with("layernorm.weight") || name == "model.norm.weight";
         let bytes = if is_norm {
             bf16_bytes((0..n).map(|_| 1.0 + 0.1 * rng.next()))
+        } else if let (Some(g), 2) = (grid, shape.len()) {
+            let (bits, group) = if name == "model.embed_tokens.weight" { g.embed } else { g.body };
+            grid_bytes(&mut rng, shape[0], shape[1], bits, group)
         } else {
             bf16_bytes((0..n).map(|_| 0.15 * rng.next()))
         };

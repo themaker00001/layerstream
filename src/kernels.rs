@@ -2,6 +2,7 @@
 //! fly, so a layer takes 2 bytes per parameter in memory instead of 4.
 
 use crate::pool::{Pool, SyncPtr};
+use crate::weights::WeightFormat;
 
 #[inline(always)]
 pub fn bf16_to_f32(bits: u16) -> f32 {
@@ -41,16 +42,98 @@ pub fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
     sum
 }
 
+#[inline(always)]
+fn scale_at(scales: &[u8], g: usize) -> f32 {
+    bf16_to_f32(u16::from_le_bytes([scales[2 * g], scales[2 * g + 1]]))
+}
+
+/// Dot product of an 8-bit quantized row with an f32 vector. A stored row is `cols` signed
+/// bytes followed by one bf16 scale per `group` of them.
+#[inline]
+pub fn dot_q8(row: &[u8], x: &[f32], group: usize) -> f32 {
+    let cols = x.len();
+    debug_assert_eq!(row.len(), cols + cols / group * 2);
+    let (data, scales) = row.split_at(cols);
+    let mut total = 0.0f32;
+    for (g, (qg, xg)) in data.chunks_exact(group).zip(x.chunks_exact(group)).enumerate() {
+        let mut acc = [0.0f32; 8];
+        for (qc, xc) in qg.chunks_exact(8).zip(xg.chunks_exact(8)) {
+            for k in 0..8 {
+                acc[k] += (qc[k] as i8) as f32 * xc[k];
+            }
+        }
+        total += scale_at(scales, g) * acc.iter().sum::<f32>();
+    }
+    total
+}
+
+/// Dot product of a 4-bit quantized row with an f32 vector. Inside a group of `group`
+/// weights, byte `j` holds weight `j` in its low nibble and weight `j + group / 2` in its
+/// high nibble, each stored as `value + 8`.
+#[inline]
+pub fn dot_q4(row: &[u8], x: &[f32], group: usize) -> f32 {
+    let cols = x.len();
+    debug_assert_eq!(row.len(), cols / 2 + cols / group * 2);
+    let (data, scales) = row.split_at(cols / 2);
+    let half = group / 2;
+    let mut total = 0.0f32;
+    for (g, (bytes, xg)) in data.chunks_exact(half).zip(x.chunks_exact(group)).enumerate() {
+        let (x_lo, x_hi) = xg.split_at(half);
+        let mut acc = [0.0f32; 8];
+        for ((bc, lo), hi) in bytes.chunks_exact(8).zip(x_lo.chunks_exact(8)).zip(x_hi.chunks_exact(8)) {
+            for k in 0..8 {
+                let b = bc[k];
+                acc[k] += ((b & 15) as i32 - 8) as f32 * lo[k] + ((b >> 4) as i32 - 8) as f32 * hi[k];
+            }
+        }
+        total += scale_at(scales, g) * acc.iter().sum::<f32>();
+    }
+    total
+}
+
+/// Widen one stored row (of whichever format) into f32 values.
+pub fn dequant_row(fmt: WeightFormat, raw: &[u8], out: &mut [f32]) {
+    let WeightFormat::Quant { bits, group } = fmt else {
+        return bf16_slice_to_f32(raw, out);
+    };
+    let cols = out.len();
+    assert!(cols.is_multiple_of(group), "row width is not a multiple of the group size");
+    assert_eq!(raw.len(), fmt.row_bytes(cols), "quantized row has the wrong size");
+    let (data, scales) = raw.split_at(cols * bits as usize / 8);
+    for (g, og) in out.chunks_exact_mut(group).enumerate() {
+        let s = scale_at(scales, g);
+        match bits {
+            8 => {
+                for (o, &q) in og.iter_mut().zip(&data[g * group..(g + 1) * group]) {
+                    *o = (q as i8) as f32 * s;
+                }
+            }
+            4 => {
+                let half = group / 2;
+                for (j, &b) in data[g * half..(g + 1) * half].iter().enumerate() {
+                    og[j] = ((b & 15) as i32 - 8) as f32 * s;
+                    og[j + half] = ((b >> 4) as i32 - 8) as f32 * s;
+                }
+            }
+            _ => unreachable!("the bit width is validated when the config is read"),
+        }
+    }
+}
+
 const ROW_BLOCK: usize = 16;
 
-/// `y[t][r] = sum_c w[r][c] * x[t][c]` for `t` input vectors, with `w` a `rows x cols`
-/// bf16 matrix. Work is split into blocks of output rows across the pool.
-pub fn matmul_bf16(pool: &Pool, w: &[u8], rows: usize, cols: usize, x: &[f32], t: usize, y: &mut [f32]) {
-    assert_eq!(w.len(), rows * cols * 2, "weight matrix has the wrong size");
+/// `y[t][r] = dot(stored row r of w, x[t])` for `t` input vectors, where `dot` knows how one
+/// stored row of `row_bytes` bytes is laid out. Work is split into blocks of output rows
+/// across the pool.
+#[allow(clippy::too_many_arguments)]
+fn matmul_rows<F>(pool: &Pool, w: &[u8], rows: usize, row_bytes: usize, cols: usize, x: &[f32], t: usize, y: &mut [f32], dot: F)
+where
+    F: Fn(&[u8], &[f32]) -> f32 + Sync,
+{
+    assert_eq!(w.len(), rows * row_bytes, "weight matrix has the wrong size");
     assert_eq!(x.len(), t * cols);
     assert_eq!(y.len(), t * rows);
     let n_tasks = rows.div_ceil(ROW_BLOCK);
-    let row_bytes = cols * 2;
 
     if t == 1 {
         let out = SyncPtr::new(y);
@@ -61,7 +144,7 @@ pub fn matmul_bf16(pool: &Pool, w: &[u8], rows: usize, cols: usize, x: &[f32], t
             let dst = unsafe { std::slice::from_raw_parts_mut(out.get().add(r0), r1 - r0) };
             for (k, o) in dst.iter_mut().enumerate() {
                 let r = r0 + k;
-                *o = dot_bf16(&w[r * row_bytes..(r + 1) * row_bytes], x);
+                *o = dot(&w[r * row_bytes..(r + 1) * row_bytes], x);
             }
         });
         return;
@@ -79,7 +162,7 @@ pub fn matmul_bf16(pool: &Pool, w: &[u8], rows: usize, cols: usize, x: &[f32], t
         for r in r0..r1 {
             let wr = &w[r * row_bytes..(r + 1) * row_bytes];
             for tt in 0..t {
-                dst[(r - r0) * t + tt] = dot_bf16(wr, &x[tt * cols..(tt + 1) * cols]);
+                dst[(r - r0) * t + tt] = dot(wr, &x[tt * cols..(tt + 1) * cols]);
             }
         }
     });
@@ -87,6 +170,35 @@ pub fn matmul_bf16(pool: &Pool, w: &[u8], rows: usize, cols: usize, x: &[f32], t
         for r in 0..rows {
             y[tt * rows + r] = tmp[r * t + tt];
         }
+    }
+}
+
+/// `y[t][r] = sum_c w[r][c] * x[t][c]` for `t` input vectors, with `w` a `rows x cols`
+/// bf16 matrix.
+pub fn matmul_bf16(pool: &Pool, w: &[u8], rows: usize, cols: usize, x: &[f32], t: usize, y: &mut [f32]) {
+    matmul_rows(pool, w, rows, cols * 2, cols, x, t, y, dot_bf16);
+}
+
+/// The same product with an 8-bit quantized matrix.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_q8(pool: &Pool, w: &[u8], rows: usize, cols: usize, group: usize, x: &[f32], t: usize, y: &mut [f32]) {
+    matmul_rows(pool, w, rows, cols + cols / group * 2, cols, x, t, y, |r, xv| dot_q8(r, xv, group));
+}
+
+/// The same product with a 4-bit quantized matrix.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_q4(pool: &Pool, w: &[u8], rows: usize, cols: usize, group: usize, x: &[f32], t: usize, y: &mut [f32]) {
+    matmul_rows(pool, w, rows, cols / 2 + cols / group * 2, cols, x, t, y, |r, xv| dot_q4(r, xv, group));
+}
+
+/// Matrix product with the weights in whichever format they are stored in.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul(pool: &Pool, fmt: WeightFormat, w: &[u8], rows: usize, cols: usize, x: &[f32], t: usize, y: &mut [f32]) {
+    match fmt {
+        WeightFormat::Bf16 => matmul_bf16(pool, w, rows, cols, x, t, y),
+        WeightFormat::Quant { bits: 8, group } => matmul_q8(pool, w, rows, cols, group, x, t, y),
+        WeightFormat::Quant { bits: 4, group } => matmul_q4(pool, w, rows, cols, group, x, t, y),
+        WeightFormat::Quant { bits, .. } => panic!("unsupported bit width {bits}"),
     }
 }
 

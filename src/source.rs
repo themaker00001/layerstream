@@ -82,7 +82,7 @@ pub fn embed_row_f32(src: &dyn Source, token: usize, out: &mut [f32]) -> Result<
     }
     let mut raw = vec![0u8; cfg.row_bytes()];
     src.read_embed_rows(token, 1, &mut raw)?;
-    crate::kernels::bf16_slice_to_f32(&raw, out);
+    crate::kernels::dequant_row(cfg.embed_format, &raw, out);
     sys::wipe(&mut raw);
     Ok(())
 }

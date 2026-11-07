@@ -167,7 +167,7 @@ impl Model {
             logits = vec![0.0f32; self.cfg.vocab];
             for c in 0..self.provider.n_head_chunks() {
                 let chunk = self.provider.head_chunk(c)?;
-                matmul_bf16(&self.pool, chunk.data, chunk.rows, h, &hf, 1, &mut logits[chunk.first..chunk.first + chunk.rows]);
+                matmul(&self.pool, self.cfg.embed_format, chunk.data, chunk.rows, h, &hf, 1, &mut logits[chunk.first..chunk.first + chunk.rows]);
             }
         }
         self.provider.end_forward()?;
@@ -194,11 +194,12 @@ fn layer_forward(
 
     // --- attention ---------------------------------------------------------------
     rms_norm_bf16(x, w.t(T_INPUT_NORM), cfg.eps, &mut sc.h);
-    matmul_bf16(pool, w.t(T_Q_W), h, h, &sc.h, t, &mut sc.q);
+    let fmt = cfg.format;
+    matmul(pool, fmt, w.t(T_Q_W), h, h, &sc.h, t, &mut sc.q);
     add_bias_bf16(&mut sc.q, w.t(T_Q_B), t);
-    matmul_bf16(pool, w.t(T_K_W), kvd, h, &sc.h, t, &mut sc.k);
+    matmul(pool, fmt, w.t(T_K_W), kvd, h, &sc.h, t, &mut sc.k);
     add_bias_bf16(&mut sc.k, w.t(T_K_B), t);
-    matmul_bf16(pool, w.t(T_V_W), kvd, h, &sc.h, t, &mut sc.v);
+    matmul(pool, fmt, w.t(T_V_W), kvd, h, &sc.h, t, &mut sc.v);
     add_bias_bf16(&mut sc.v, w.t(T_V_B), t);
 
     for i in 0..t {
@@ -235,19 +236,19 @@ fn layer_forward(
             }
         }
     }
-    matmul_bf16(pool, w.t(T_O_W), h, h, &sc.attn, t, &mut sc.proj);
+    matmul(pool, fmt, w.t(T_O_W), h, h, &sc.attn, t, &mut sc.proj);
     for (xv, p) in x.iter_mut().zip(&sc.proj) {
         *xv += p;
     }
 
     // --- MLP (SwiGLU) --------------------------------------------------------------
     rms_norm_bf16(x, w.t(T_POST_NORM), cfg.eps, &mut sc.h);
-    matmul_bf16(pool, w.t(T_GATE), inter, h, &sc.h, t, &mut sc.gate);
-    matmul_bf16(pool, w.t(T_UP), inter, h, &sc.h, t, &mut sc.up);
+    matmul(pool, fmt, w.t(T_GATE), inter, h, &sc.h, t, &mut sc.gate);
+    matmul(pool, fmt, w.t(T_UP), inter, h, &sc.h, t, &mut sc.up);
     for (g, u) in sc.gate.iter_mut().zip(&sc.up) {
         *g = silu(*g) * u;
     }
-    matmul_bf16(pool, w.t(T_DOWN), h, inter, &sc.gate, t, &mut sc.proj);
+    matmul(pool, fmt, w.t(T_DOWN), h, inter, &sc.gate, t, &mut sc.proj);
     for (xv, p) in x.iter_mut().zip(&sc.proj) {
         *xv += p;
     }

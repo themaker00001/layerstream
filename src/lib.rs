@@ -6,6 +6,7 @@ pub mod kernels;
 pub mod model;
 pub mod pool;
 pub mod provider;
+pub mod quant;
 pub mod safetensors;
 pub mod seal;
 pub mod source;

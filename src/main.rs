@@ -4,7 +4,8 @@ use layerstream::seal::{self, OpenOptions, SealParams, SealedSource, SecretKey};
 use layerstream::source::{FileSource, Source, Throttle};
 use layerstream::sys;
 use layerstream::tokenizer::{StreamDecoder, Tokenizer};
-use layerstream::weights::ModelFiles;
+use layerstream::quant;
+use layerstream::weights::{ModelFiles, QuantHeader, WeightFormat};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use std::time::Instant;
 const DEFAULT_SYSTEM: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 const DEFAULT_PROMPT: &str = "Explain in two sentences why the sky is blue.";
 const EOS: [u32; 2] = [151645, 151643];
-const BOOL_FLAGS: &[&str] = &["raw", "report", "quiet", "wipe", "help", "no-verify", "quick"];
+const BOOL_FLAGS: &[&str] = &["raw", "report", "quiet", "wipe", "help", "no-verify", "quick", "rtn"];
 
 fn usage() -> ! {
     eprintln!(
@@ -25,10 +26,15 @@ USAGE
   layerstream bench    --model DIR [options]       compare memory and speed of every mode
   layerstream gen-key  PATH                        write a new random key (mode 0600)
   layerstream seal     --model DIR --out FILE --key-file KEY     encrypt the model
+                       (or --quantized FILE instead of --model, to encrypt a quantized model)
+  layerstream quantize --model DIR --out FILE [--bits 8|4] [--group N] [--rtn]
+                                                   store the weights as 8- or 4-bit integers
+  layerstream eval     --model DIR --text FILE [options]   perplexity of the model on a text file
   layerstream tokenize --model DIR                 print token ids for each line on stdin
 
 COMMON OPTIONS
   --model DIR          directory with the model files (tokenizer files are always read from here)
+  --quantized FILE     read the weights from a file made by `quantize` instead of the bf16 ones
   --sealed FILE        read the model from an encrypted file made by `seal` (needs --key-file
                        or LAYERSTREAM_KEY); the plaintext weights are not touched
   --mode MODE          resident (load everything into memory) or stream (default)
@@ -45,8 +51,21 @@ GENERATE OPTIONS
   --temperature F      0 = greedy (default); also --top-k N, --top-p F, --seed N
   --report             print one machine-readable RESULT line instead of the text
 
+QUANTIZE OPTIONS
+  --bits N             8 (default) or 4          --group N   weights per shared scale (default 64
+                       for 8 bits, 32 for 4 bits)   --rtn   plain rounding instead of clip search
+  --embed-bits N --embed-group N   a different format for the embedding table / output layer
+                       (default: same as the layers)
+
+EVAL OPTIONS
+  --text FILE          text to score, token by token   --max-tokens N   (default 512)
+  --save-top1 FILE     write the model's top choice at every position
+  --agree-with FILE    report how often this model's top choice matches a saved one
+
 BENCH OPTIONS
   --sealed FILE --key-file KEY    also benchmark the encrypted file
+  --quantized FILE                also benchmark a quantized file
+  --quantized-sealed FILE         also benchmark an encrypted quantized file (needs --key-file)
   --max-new N                     tokens per run (default 32)   --quick   fewer, shorter runs"
     );
     std::process::exit(2);
@@ -131,9 +150,9 @@ struct Built {
     load_secs: f64,
 }
 
-fn build(args: &Args) -> Built {
+fn build(args: &Args, default_mode: &str) -> Built {
     let dir = args.model_dir();
-    let mode = args.str("mode").unwrap_or("stream").to_string();
+    let mode = args.str("mode").unwrap_or(default_mode).to_string();
     let slots: usize = args.num("slots", 2);
     let threads: usize = args.num("threads", default_threads());
     let max_ctx: usize = args.num("max-ctx", 1024);
@@ -147,13 +166,18 @@ fn build(args: &Args) -> Built {
     });
 
     let t0 = Instant::now();
-    let source: Arc<dyn Source> = match args.str("sealed") {
-        Some(path) => {
+    let source: Arc<dyn Source> = match (args.str("sealed"), args.str("quantized")) {
+        (Some(_), Some(_)) => die("use --sealed or --quantized, not both (encrypt a quantized file with `seal --quantized`)"),
+        (Some(path), None) => {
             let key = SecretKey::from_cli(args.str("key-file")).unwrap_or_else(|e| die(e));
             let opts = OpenOptions { throttle, threads: None };
             Arc::new(SealedSource::open(Path::new(path), key, opts).unwrap_or_else(|e| die(e)))
         }
-        None => {
+        (None, Some(path)) => {
+            let files = ModelFiles::open_quantized(Path::new(path)).unwrap_or_else(|e| die(e));
+            Arc::new(FileSource::open(files).unwrap_or_else(|e| die(e)).with_throttle(throttle))
+        }
+        (None, None) => {
             let files = ModelFiles::open(&dir).unwrap_or_else(|e| die(e));
             Arc::new(FileSource::open(files).unwrap_or_else(|e| die(e)).with_throttle(throttle))
         }
@@ -187,7 +211,7 @@ fn cmd_generate(args: &Args) {
     let quiet = args.has("quiet") || report;
     let mut sampler = Sampler::new(args.num("temperature", 0.0), args.num("top-k", 40), args.num("top-p", 0.95), args.num("seed", 1));
 
-    let Built { mut model, label, load_secs } = build(args);
+    let Built { mut model, label, load_secs } = build(args, "stream");
     let rss_after_load = sys::peak_rss_bytes();
     let bytes_at_load = model.report().io.bytes_read;
     if prompt_ids.len() + max_new > model.max_ctx() {
@@ -313,15 +337,26 @@ fn cmd_gen_key(args: &Args) {
 }
 
 fn cmd_seal(args: &Args) {
-    let dir = args.model_dir();
     let out = PathBuf::from(args.str("out").unwrap_or_else(|| die("--out FILE is required")));
     let key = SecretKey::from_cli(args.str("key-file")).unwrap_or_else(|e| die(e));
     let params = SealParams {
         layer_chunk: args.num("layer-chunk", SealParams::default().layer_chunk),
         embed_chunk_rows: args.num("embed-chunk-rows", SealParams::default().embed_chunk_rows),
     };
-    let config_text = std::fs::read_to_string(dir.join("config.json")).unwrap_or_else(|e| die(format!("config.json: {e}")));
-    let src = FileSource::open(ModelFiles::open(&dir).unwrap_or_else(|e| die(e))).unwrap_or_else(|e| die(e));
+    let (config_text, files) = match args.str("quantized") {
+        Some(q) => (
+            QuantHeader::read(Path::new(q)).unwrap_or_else(|e| die(e)).config_text,
+            ModelFiles::open_quantized(Path::new(q)).unwrap_or_else(|e| die(e)),
+        ),
+        None => {
+            let dir = args.model_dir();
+            (
+                std::fs::read_to_string(dir.join("config.json")).unwrap_or_else(|e| die(format!("config.json: {e}"))),
+                ModelFiles::open(&dir).unwrap_or_else(|e| die(e)),
+            )
+        }
+    };
+    let src = FileSource::open(files).unwrap_or_else(|e| die(e));
     let prefix = seal::random_nonce_prefix().unwrap_or_else(|e| die(e));
     let t = Instant::now();
     let s = seal::seal_model(&src, &config_text, &key, prefix, params, &out).unwrap_or_else(|e| die(e));
@@ -339,6 +374,95 @@ fn cmd_seal(args: &Args) {
         seal::verify_same(&src, &sealed).unwrap_or_else(|e| die(format!("self-check failed: {e}")));
         println!("[ok] self-check: decrypting the new file gives exactly the original weights.");
     }
+}
+
+fn cmd_quantize(args: &Args) {
+    let dir = args.model_dir();
+    let out = PathBuf::from(args.str("out").unwrap_or_else(|| die("--out FILE is required")));
+    let bits: u8 = args.num("bits", 8);
+    let group: usize = args.num("group", if bits == 4 { 32 } else { 64 });
+    let fmt = WeightFormat::Quant { bits, group };
+    let embed_fmt = WeightFormat::Quant { bits: args.num("embed-bits", bits), group: args.num("embed-group", group) };
+    let clip = !args.has("rtn");
+    let config_text = std::fs::read_to_string(dir.join("config.json")).unwrap_or_else(|e| die(format!("config.json: {e}")));
+    let files = ModelFiles::open(&dir).unwrap_or_else(|e| die(e));
+    fmt.validate(&[files.cfg.hidden, files.cfg.inter]).unwrap_or_else(|e| die(e));
+    embed_fmt.validate(&[files.cfg.hidden]).unwrap_or_else(|e| die(e));
+    let src = FileSource::open(files).unwrap_or_else(|e| die(e));
+    let t = Instant::now();
+    let s = quant::quantize_model(&src, &config_text, fmt, embed_fmt, clip, args.num("threads", default_threads()), &out)
+        .unwrap_or_else(|e| die(e));
+    println!(
+        "[ok] {}{} ({}): {:.0} MB -> {:.0} MB ({:.2}x smaller); weight error {:.2}% of the weights' RMS; {:.1} s",
+        fmt.name(),
+        if embed_fmt == fmt { String::new() } else { format!(", embedding {}", embed_fmt.name()) },
+        if clip { "clip search" } else { "round to nearest" },
+        mb(s.in_bytes),
+        mb(s.out_bytes),
+        s.in_bytes as f64 / s.out_bytes as f64,
+        s.rel_rmse * 100.0,
+        t.elapsed().as_secs_f64()
+    );
+    println!("     wrote {}", out.display());
+}
+
+/// Teacher-forced scoring: feed the text one token at a time and measure how much probability
+/// the model gave to each next token. Lower perplexity = the model predicts the text better.
+fn cmd_eval(args: &Args) {
+    let tok = Tokenizer::load(&args.model_dir()).unwrap_or_else(|e| die(e));
+    let path = args.str("text").unwrap_or_else(|| die("--text FILE is required"));
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
+    let max_tokens: usize = args.num("max-tokens", 512);
+    let mut ids = tok.encode(&text);
+    ids.truncate(max_tokens + 1);
+    if ids.len() < 2 {
+        die("the text is too short to score");
+    }
+    let Built { mut model, label, .. } = build(args, "resident");
+    let n = ids.len() - 1;
+    if n > model.max_ctx() {
+        die(format!("{n} tokens exceed --max-ctx ({})", model.max_ctx()));
+    }
+    let (mut nll, mut hits) = (0.0f64, 0usize);
+    let mut top1: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let logits = model.forward(&ids[i..i + 1]).unwrap_or_else(|e| die(e));
+        let (mut best, mut max) = (0usize, f32::NEG_INFINITY);
+        for (j, &v) in logits.iter().enumerate() {
+            if v > max {
+                max = v;
+                best = j;
+            }
+        }
+        let lse = max as f64 + logits.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln();
+        let target = ids[i + 1] as usize;
+        nll += lse - logits[target] as f64;
+        hits += usize::from(best == target);
+        top1.push(best as u32);
+    }
+    let mean = nll / n as f64;
+    // A fingerprint of the exact tokens scored, so two runs can be checked to have used the
+    // same text before their numbers are compared.
+    let text_hash = ids.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &t| (h ^ t as u64).wrapping_mul(0x0000_0100_0000_01b3));
+    let mut agree = String::from("-");
+    if let Some(p) = args.str("agree-with") {
+        let other = std::fs::read_to_string(p).unwrap_or_else(|e| die(format!("{p}: {e}")));
+        let other: Vec<u32> = other.trim().split(',').filter_map(|s| s.parse().ok()).collect();
+        if other.len() != top1.len() {
+            die(format!("{p} holds {} positions but this run scored {}", other.len(), top1.len()));
+        }
+        let same = top1.iter().zip(&other).filter(|(a, b)| a == b).count();
+        agree = format!("{:.4}", same as f64 / n as f64);
+    }
+    if let Some(p) = args.str("save-top1") {
+        let s: Vec<String> = top1.iter().map(u32::to_string).collect();
+        std::fs::write(p, s.join(",")).unwrap_or_else(|e| die(format!("{p}: {e}")));
+    }
+    println!(
+        "EVAL tokens={n} text={text_hash:016x} mean_nll={mean:.4} ppl={:.3} top1_acc={:.4} top1_agree={agree}   [{label}]",
+        mean.exp(),
+        hits as f64 / n as f64
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -389,8 +513,10 @@ fn cmd_bench(args: &Args) {
     let prompt = args.str("prompt").unwrap_or(DEFAULT_PROMPT).to_string();
     let sealed = args.str("sealed").map(str::to_string);
     let key_file = args.str("key-file").map(str::to_string);
-    if sealed.is_some() && key_file.is_none() && std::env::var("LAYERSTREAM_KEY").is_err() {
-        die("--sealed needs --key-file (or LAYERSTREAM_KEY)");
+    let quantized = args.str("quantized").map(str::to_string);
+    let q_sealed = args.str("quantized-sealed").map(str::to_string);
+    if (sealed.is_some() || q_sealed.is_some()) && key_file.is_none() && std::env::var("LAYERSTREAM_KEY").is_err() {
+        die("--sealed and --quantized-sealed need --key-file (or LAYERSTREAM_KEY)");
     }
 
     struct Cfg {
@@ -431,6 +557,43 @@ fn cmd_bench(args: &Args) {
         });
     }
 
+    // Quantized models are different models from the bf16 one: their rows are labelled
+    // "quantized" so they are compared with each other, not with the bf16 runs.
+    if let Some(path) = &quantized {
+        let with = |more: &[&str]| {
+            let mut v = vec!["--quantized".to_string(), path.clone()];
+            v.extend(more.iter().map(|x| x.to_string()));
+            v
+        };
+        cfgs.push(Cfg { label: "quantized: resident".into(), extra: with(&["--mode", "resident"]), max_new });
+        cfgs.push(Cfg { label: "quantized: stream, 1 buffer".into(), extra: with(&["--mode", "stream", "--slots", "1"]), max_new });
+        cfgs.push(Cfg { label: "quantized: stream, 2 buffers".into(), extra: with(&["--mode", "stream", "--slots", "2"]), max_new });
+        for mbps in [2000.0, 500.0] {
+            cfgs.push(Cfg {
+                label: format!("quantized: stream, capped at {mbps:.0} MB/s"),
+                extra: with(&["--mode", "stream", "--slots", "2", "--throttle-mbps", &format!("{mbps}")]),
+                max_new: capped_new,
+            });
+        }
+    }
+    if let Some(path) = &q_sealed {
+        let mut base = vec!["--sealed".to_string(), path.clone()];
+        if let Some(k) = &key_file {
+            base.extend(["--key-file".to_string(), k.clone()]);
+        }
+        let with = |more: &[&str]| {
+            let mut v = base.clone();
+            v.extend(more.iter().map(|x| x.to_string()));
+            v
+        };
+        cfgs.push(Cfg { label: "encrypted quantized: stream, 2 buffers".into(), extra: with(&["--mode", "stream", "--slots", "2", "--wipe"]), max_new });
+        cfgs.push(Cfg {
+            label: "encrypted quantized: stream, capped at 500 MB/s".into(),
+            extra: with(&["--mode", "stream", "--slots", "2", "--wipe", "--throttle-mbps", "500"]),
+            max_new: capped_new,
+        });
+    }
+
     println!("prompt: {prompt:?}  (greedy; every run in a fresh process)\n");
     let mut results: Vec<(String, Option<Run>)> = Vec::new();
     for cfg in &cfgs {
@@ -448,22 +611,26 @@ fn cmd_bench(args: &Args) {
         results.push((cfg.label.clone(), run));
     }
 
-    let reference = results.iter().find_map(|(_, r)| r.as_ref().map(|r| r.ids.clone()));
+    let reference_for = |quantized: bool| {
+        results.iter().find_map(|(l, r)| if l.contains("quantized") == quantized { r.as_ref().map(|r| r.ids.clone()) } else { None })
+    };
+    let (ref_plain, ref_quant) = (reference_for(false), reference_for(true));
     println!(
-        "\n{:<38} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9}  identical",
+        "\n{:<48} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9}  identical",
         "configuration", "peak MB", "model MB", "load s", "tokens/s", "read MB/tok", "wait s"
     );
-    println!("{}", "-".repeat(112));
+    println!("{}", "-".repeat(122));
     for (label, run) in &results {
         let Some(r) = run else {
-            println!("{label:<38} (failed)");
+            println!("{label:<48} (failed)");
             continue;
         };
+        let reference = if label.contains("quantized") { &ref_quant } else { &ref_plain };
         let n = r.ids.len().min(reference.as_ref().map_or(0, Vec::len));
         let same = reference.as_ref().is_some_and(|ref_ids| ref_ids[..n] == r.ids[..n]);
         let read = if r.per_token_mb > 0.0 { format!("{:.0}", r.per_token_mb) } else { "-".into() };
         println!(
-            "{label:<38} {:>9.0} {:>9.0} {:>9.2} {:>9.1} {:>10} {:>9.2}  {}",
+            "{label:<48} {:>9.0} {:>9.0} {:>9.2} {:>9.1} {:>10} {:>9.2}  {}",
             mb(r.peak as u64),
             mb((r.peak - r.tokenizer).max(0.0) as u64),
             r.load_s,
@@ -474,7 +641,9 @@ fn cmd_bench(args: &Args) {
         );
         let _ = (r.first_s, r.decrypt_s, r.new_tokens);
     }
-    println!("\npeak MB: whole process. model MB: peak minus the tokenizer's own footprint.");
+    println!("\nidentical: same tokens as the first run of its kind. Quantized models are different models from the bf16 one,");
+    println!("so they are compared with each other, not with the bf16 runs.");
+    println!("peak MB: whole process. model MB: peak minus the tokenizer's own footprint.");
     println!("tokens/s: generation after the first token. wait s: time the engine stalled waiting for weights.");
 }
 
@@ -488,6 +657,8 @@ fn main() {
         "tokenize" => cmd_tokenize(&args),
         "gen-key" => cmd_gen_key(&args),
         "seal" => cmd_seal(&args),
+        "quantize" => cmd_quantize(&args),
+        "eval" => cmd_eval(&args),
         "bench" => cmd_bench(&args),
         _ => usage(),
     }

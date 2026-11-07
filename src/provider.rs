@@ -99,7 +99,7 @@ impl Provider for ResidentProvider {
         if token >= self.source.cfg().vocab {
             return Err(format!("token id {token} is outside the vocabulary"));
         }
-        crate::kernels::bf16_slice_to_f32(&self.embed[token * rb..(token + 1) * rb], out);
+        crate::kernels::dequant_row(self.source.cfg().embed_format, &self.embed[token * rb..(token + 1) * rb], out);
         Ok(())
     }
 

@@ -3,9 +3,10 @@
 Run a language model that is bigger than your memory budget by keeping only a couple of
 layers in memory at a time, and measure what that costs.
 
-A small Rust program with no dependencies. The tokenizer, the weights reader, the transformer
-and the (optional) encryption are written from scratch and checked against the reference
-implementations. It runs **Qwen2.5-0.5B-Instruct**, a real pretrained chat model.
+A small Rust program with no dependencies. The tokenizer, the weights reader, the transformer,
+the (optional) 8-bit and 4-bit quantization and the (optional) encryption are written from
+scratch and checked against the reference implementations. It runs **Qwen2.5-0.5B-Instruct**,
+a real pretrained chat model.
 
 ```text
 $ layerstream generate --model models/Qwen2.5-0.5B-Instruct --prompt "Explain what a CPU does in two sentences."
@@ -44,6 +45,9 @@ What it says:
   `storage MB/s / 942`, and the capped runs sit within about 5% of that ceiling.
 - **Encryption at rest:** if you load everything once, decrypting costs a one-time 0.3 to 0.5 s
   at startup. If you stream, every token decrypts about 1 GB, and speed falls to 2.9 tokens/s.
+- **Fewer bits:** storing the weights as 8-bit integers halves the bytes read per token and about
+  doubles the speed, with no quality loss I could measure; 4-bit is faster still but costs
+  quality on this small model. See [Quantization](#quantization-fewer-bytes-per-token).
 
 ### How to read these numbers honestly
 
@@ -72,6 +76,83 @@ What it says:
   matrix (untied embeddings) are not supported yet.
 - **Peak memory** is the whole process (it includes a 14 MB tokenizer and the key/value cache
   pages actually used), measured with `getrusage`.
+
+## Quantization: fewer bytes per token
+
+Streaming speed is set by how many bytes must be read for every token, so storing the weights
+in fewer bits speeds up everything that is limited by storage, and shrinks the layer buffers
+too. `layerstream quantize` turns the bf16 model into a file where every weight is an 8-bit or
+4-bit integer, with one shared scale for each group of 16 to 64 weights of a row. It takes about
+a second.
+
+```text
+$ layerstream quantize --model models/Qwen2.5-0.5B-Instruct --out models/int8.lsq --bits 8 --group 64
+[ok] int8, groups of 64 (clip search): 942 MB -> 486 MB (1.94x smaller); weight error 0.64% of the weights' RMS; 0.6 s
+```
+
+**Speed and memory.** Same machine and method as the table above; greedy decoding, every
+configuration in a fresh process (`layerstream bench --quantized ...`).
+
+| Weights | File (= read per token) | Peak memory, streamed | Tokens/s, file cached | Tokens/s, storage capped at 2,000 MB/s | Tokens/s, capped at 500 MB/s | Tokens/s, encrypted and streamed |
+|---|---:|---:|---:|---:|---:|---:|
+| bf16 (as shipped) | 942 MB | 76 MB | 13 | 2.0 | 0.5 | 2.8 |
+| int8, groups of 64 | 486 MB | 49 MB | 26.7 | 3.9 | 1.0 | 5.2 |
+| int4, groups of 16 | 295 MB | 36 MB | 41.2 | 6.5 | 1.6 | 8.2 |
+
+Everything held in memory instead of streamed: 962 MB at 33 tokens/s (bf16), 505 MB at 63
+tokens/s (int8), 314 MB at 49 tokens/s (int4).
+
+**Quality.** Perplexity (lower is better) and agreement with the bf16 model, scoring 512 tokens
+of two texts token by token: frozen copies of this README ("prose") and of `src/model.rs`
+("code") as of commit 3aacc7f, kept in `eval/` so the numbers cannot drift when those files change. "Top choice" is how often the model's most likely next
+token matches the bf16 model's. "Answers" is how many of six prompts gave a word-for-word
+identical 48-token greedy answer to bf16's. Reproduce with `scripts/quant_eval.sh`.
+
+| Weights | File | Perplexity, prose | Perplexity, code | Top choice = bf16's, prose / code | Answers identical |
+|---|---:|---:|---:|---:|---:|
+| bf16 | 942 MB | 12.65 | 4.83 | 100% / 100% | 6 of 6 |
+| int8, groups of 64 | 486 MB | 12.61 | 4.83 | 98.4% / 99.2% | 3 of 6 |
+| int8, groups of 32 | 501 MB | 12.62 | 4.84 | 98.8% / 99.6% | 6 of 6 |
+| int4, groups of 64 | 250 MB | 16.03 | 6.23 | 75.0% / 81.3% | 0 of 6 |
+| int4, groups of 32 | 265 MB | 15.11 | 5.82 | 77.9% / 85.5% | 0 of 6 |
+| int4, groups of 32, embedding int8 | 326 MB | 14.61 | 5.60 | 82.2% / 87.9% | 0 of 6 |
+| int4, groups of 16 | 295 MB | 13.94 | 5.49 | 80.5% / 87.1% | 0 of 6 |
+
+What it says:
+
+- **8-bit costs nothing I could measure.** Perplexity is within 0.3% of bf16 on both texts, the
+  top choice matches bf16's at 98 to 99.6% of positions, and with groups of 32 all six answers
+  came out word for word the same as bf16's. With groups of 64, three of the six drift after 34
+  to 42 tokens.
+- **4-bit does cost quality on this model.** Perplexity is 10 to 29% higher and the answers
+  differ from bf16's within the first few tokens. Some are wrong: asked why we have seasons,
+  bf16 and int8 answer with the tilt of the Earth's axis, while int4 with groups of 32 says
+  "gravitational forces of the planets and the Earth's rotation". A 0.5B model has little
+  precision to spare. Larger models usually lose less at 4 bits, but I have not measured that
+  here. Use 8-bit; 4-bit is for when memory or storage leaves no choice.
+- **Speed follows bytes while storage is the limit.** Capped at 500 MB/s, int8 (1.94x fewer
+  bytes) runs 2x faster and int4 (3.2x fewer) 3.2x faster. With the file cached the gains are
+  2x and 3.2x too.
+- **4-bit is not faster when everything is in memory.** Unpacking nibbles costs compute, so
+  int4 resident (49 tokens/s) is slower than int8 resident (63). It only wins when bytes are the
+  limit, which is the streaming case.
+- **Encrypted streaming is limited by decryption** (about 2.5 GB/s here, with a hand-written
+  cipher), so a smaller file helps directly: 2.8, 5.2 and 8.2 tokens/s. Quantize first, then
+  encrypt (`seal --quantized`).
+
+Things that did not help, kept here because they were reasonable guesses:
+
+- **Clip search** (each group tries a few clipping ratios and keeps the best) lowers the weight
+  error (4-bit, groups of 32: 10.2% to 9.7% of the weights' RMS) but not the perplexity (15.116
+  with plain rounding, `--rtn`, against 15.110). It is on by default and harmless; it is not a win.
+- **Keeping the embedding table at 8 bits** under 4-bit layers helped (15.11 to 14.61) but costs
+  61 MB. Halving the group size to 16 does better (13.94) for less (295 MB against 326 MB), so
+  groups of 16 is the best 4-bit setting I found.
+
+Caveats: perplexity is measured on 512 tokens of two small texts, not a standard benchmark, so
+differences below about 0.1 are noise; one 0.5B model; and this is plain weight rounding with
+no calibration data, which is why 4-bit loses what it does (methods such as GPTQ or AWQ keep
+more at 4 bits).
 
 ## This is not a new idea
 
@@ -115,7 +196,12 @@ the costs.
   logits.
 - The encrypted file was checked with an independent implementation: Python's `cryptography`
   decrypts sampled chunks to exactly the original weights, and a single flipped bit is rejected.
-- 51 tests (`cargo test --release`). 9 of them run a whole synthetic model, so they need no
+- Quantized models: when a model's weights lie exactly on the quantization grid, the quantized
+  engine and the bf16 engine produce the same logits (to 1e-3), for 8-bit, 4-bit, several group
+  sizes and a different format for the embedding table. All streaming and encrypted modes of a
+  quantized model give bit-for-bit identical logits. Deliberately breaking the 4-bit nibble order
+  or the embedding format makes these tests fail.
+- 64 tests (`cargo test --release`). 15 of them run a whole synthetic model, so they need no
   download; the tests that use the real model skip themselves loudly if it is absent.
 
 ## Encryption at rest (optional)
@@ -150,13 +236,21 @@ M=models/Qwen2.5-0.5B-Instruct
 ./target/release/layerstream generate --model $M --mode resident     # everything in memory
 ./target/release/layerstream generate --model $M --throttle-mbps 500 --max-new 8   # emulate slow storage
 
-# 3. optional: encrypt, then run from the encrypted file
+# 3. optional: quantize (takes a second), then run from the smaller file
+./target/release/layerstream quantize --model $M --out models/int8.lsq --bits 8 --group 64
+./target/release/layerstream quantize --model $M --out models/int4.lsq --bits 4 --group 16
+./target/release/layerstream generate --model $M --quantized models/int8.lsq
+
+# 4. optional: encrypt (the plain or the quantized model), then run from the encrypted file
 ./target/release/layerstream gen-key models/my.key
 ./target/release/layerstream seal --model $M --out models/qwen.sealed --key-file models/my.key
-./target/release/layerstream generate --model $M --sealed models/qwen.sealed --key-file models/my.key
+./target/release/layerstream seal --quantized models/int8.lsq --out models/int8.sealed --key-file models/my.key
+./target/release/layerstream generate --model $M --sealed models/int8.sealed --key-file models/my.key
 
-# 4. reproduce the table (each configuration in its own process)
-./target/release/layerstream bench --model $M --sealed models/qwen.sealed --key-file models/my.key
+# 5. reproduce the tables (each configuration in its own process)
+./target/release/layerstream bench --model $M --sealed models/qwen.sealed --key-file models/my.key \
+    --quantized models/int8.lsq --quantized-sealed models/int8.sealed
+scripts/quant_eval.sh $M          # perplexity and answer agreement for every quantized variant
 ```
 
 The reference scripts need Python with `torch` and `transformers` (`scripts/reference.py`, which
@@ -166,8 +260,9 @@ build or run the Rust program.
 ## Limits
 
 - Qwen2-architecture models with tied embeddings and bf16 weights only.
-- No quantization. It is the obvious next step: INT8 would halve the bytes read per token, which
-  is what limits speed on slow storage.
+- Quantization is weight-only (activations and the key/value cache stay f32), symmetric, with
+  one scale per group and plain rounding or a small clip search. There is no calibration data
+  (nothing like GPTQ or AWQ), which is why 4-bit costs real quality on this small model.
 - Tokenizer: Unicode letter and number classes use Rust's `is_alphabetic` and `is_numeric`, and
   text is not NFC-normalised first. It matched the reference on everything tested.
 - Greedy decoding is the default and the one that was verified; temperature, top-k and top-p
@@ -194,13 +289,14 @@ Kept here because they are the kind of mistake worth checking for:
 |---|---|
 | `src/json.rs`, `src/safetensors.rs` | JSON parser and weights-file header reader |
 | `src/tokenizer.rs` | Qwen2 byte-level BPE |
-| `src/weights.rs` | config and the layout of a layer's 12 tensors |
+| `src/weights.rs` | config, weight formats, and the layout of a layer's 12 tensors |
+| `src/quant.rs` | the quantizer: bf16 model to 8-bit / 4-bit file |
 | `src/source.rs`, `src/seal.rs` | where bytes come from: plain file, or encrypted file |
 | `src/provider.rs` | resident vs streaming (with read-ahead) |
 | `src/model.rs`, `src/kernels.rs`, `src/pool.rs` | transformer, numeric kernels, thread pool |
-| `src/main.rs` | command line (`generate`, `bench`, `seal`, `gen-key`, `tokenize`) |
-| `tests/` | reference comparison, synthetic-model pipeline tests, `golden.json` |
-| `scripts/` | `reference.py` (ground truth from Hugging Face), `verify_sealed.py` |
+| `src/main.rs` | command line (`generate`, `bench`, `quantize`, `eval`, `seal`, `gen-key`, `tokenize`) |
+| `tests/` | reference comparison, synthetic-model pipeline and quantization tests, `golden.json` |
+| `scripts/` | `reference.py` (ground truth from Hugging Face), `verify_sealed.py`, `quant_eval.sh` (quality of each quantized variant) |
 
 ## Licence
 
