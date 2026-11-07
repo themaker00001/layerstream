@@ -2,6 +2,7 @@
 name = "layerstream"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Run a language model larger than your memory budget: stream it from disk one layer at a time (optionally encrypted at rest), and measure what that costs"
 
 [dependencies]

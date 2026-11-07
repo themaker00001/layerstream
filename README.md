@@ -201,3 +201,8 @@ Kept here because they are the kind of mistake worth checking for:
 | `src/main.rs` | command line (`generate`, `bench`, `seal`, `gen-key`, `tokenize`) |
 | `tests/` | reference comparison, synthetic-model pipeline tests, `golden.json` |
 | `scripts/` | `reference.py` (ground truth from Hugging Face), `verify_sealed.py` |
+
+## Licence
+
+The code is MIT licensed (see `LICENSE`). The Qwen2.5-0.5B-Instruct weights are not part of this
+repository; they are published by Alibaba Cloud under Apache-2.0.
