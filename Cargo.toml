@@ -1,0 +1,16 @@
+[package]
+name = "layerstream"
+version = "0.1.0"
+edition = "2021"
+description = "Run a language model larger than your memory budget: stream it from disk one layer at a time (optionally encrypted at rest), and measure what that costs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+debug = false
+
+[profile.test]
+opt-level = 2

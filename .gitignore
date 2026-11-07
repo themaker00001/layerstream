@@ -1,0 +1,7 @@
+/target
+/models
+*.key
+*.sealed
+*.swp
+*.swo
+.DS_Store
