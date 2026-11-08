@@ -15,7 +15,7 @@ use std::time::Instant;
 const DEFAULT_SYSTEM: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 const DEFAULT_PROMPT: &str = "Explain in two sentences why the sky is blue.";
 const EOS: [u32; 2] = [151645, 151643];
-const BOOL_FLAGS: &[&str] = &["raw", "report", "quiet", "wipe", "help", "no-verify", "quick", "rtn"];
+const BOOL_FLAGS: &[&str] = &["raw", "report", "quiet", "wipe", "help", "no-verify", "quick", "rtn", "read"];
 
 fn usage() -> ! {
     eprintln!(
@@ -31,6 +31,8 @@ USAGE
                                                    store the weights as 8- or 4-bit integers
   layerstream eval     --model DIR --text FILE [options]   perplexity of the model on a text file
   layerstream tokenize --model DIR                 print token ids for each line on stdin
+  layerstream cache    FILE [--read]               how much of FILE the OS holds in its file cache
+                                                   (--read reads it all first and measures again)
 
 COMMON OPTIONS
   --model DIR          directory with the model files (tokenizer files are always read from here)
@@ -211,6 +213,9 @@ fn cmd_generate(args: &Args) {
     let quiet = args.has("quiet") || report;
     let mut sampler = Sampler::new(args.num("temperature", 0.0), args.num("top-k", 40), args.num("top-p", 0.95), args.num("seed", 1));
 
+    // How much of the weights file the OS already holds in its cache before this run touches it.
+    let weights_file = weights_path(args);
+    let cache_before = sys::file_cache_bytes(&weights_file).ok();
     let Built { mut model, label, load_secs } = build(args, "stream");
     let rss_after_load = sys::peak_rss_bytes();
     let bytes_at_load = model.report().io.bytes_read;
@@ -249,12 +254,14 @@ fn cmd_generate(args: &Args) {
 
     let rep = model.report();
     let peak = sys::peak_rss_bytes();
+    let cache_after = sys::file_cache_bytes(&weights_file).ok();
+    let mem = sys::memory_state();
     let tok_s = if decode_secs > 0.0 { decode_forwards as f64 / decode_secs } else { 0.0 };
 
     if report {
         let ids: Vec<String> = out_ids.iter().map(u32::to_string).collect();
         println!(
-            "RESULT peak_rss={} rss_tokenizer={} rss_after_load={} load_s={:.4} first_s={:.4} decode_s={:.4} prompt_tokens={} new_tokens={} decode_forwards={} bytes_at_load={} bytes_read={} read_s={:.4} decrypt_s={:.4} wait_s={:.4} resident_weights={} kv={} ids={}",
+            "RESULT peak_rss={} rss_tokenizer={} rss_after_load={} load_s={:.4} first_s={:.4} decode_s={:.4} prompt_tokens={} new_tokens={} decode_forwards={} bytes_at_load={} bytes_read={} read_s={:.4} decrypt_s={:.4} wait_s={:.4} resident_weights={} kv={} cache_before={} cache_after={} file_size={} mem_free={} pressure={} ids={}",
             peak,
             rss_tokenizer,
             rss_after_load,
@@ -271,6 +278,11 @@ fn cmd_generate(args: &Args) {
             rep.wait_ns as f64 / 1e9,
             rep.resident_weight_bytes,
             model.kv_cache_bytes(),
+            cache_before.map_or(0, |c| c.0),
+            cache_after.map_or(0, |c| c.0),
+            cache_after.map_or(0, |c| c.1),
+            mem.map_or(0, |m| m.free_percent),
+            mem.map_or(0, |m| m.pressure),
             ids.join(",")
         );
     } else {
@@ -283,6 +295,18 @@ fn cmd_generate(args: &Args) {
             mb(rep.resident_weight_bytes),
             mb(rss_tokenizer)
         );
+        if let (Some((before, _)), Some((after, total))) = (cache_before, cache_after) {
+            eprintln!(
+                "[layerstream] OS file cache holds {:.0} MB of this {:.0} MB weights file before the run and {:.0} MB after: \
+                 real RAM, but outside the peak above, and the system may drop it at any time",
+                mb(before),
+                mb(total),
+                mb(after)
+            );
+        }
+        if let Some(m) = mem {
+            eprintln!("[layerstream] system memory: {}% free, pressure {}", m.free_percent, m.pressure_name());
+        }
         if rep.io.bytes_read > 0 {
             eprintln!(
                 "[layerstream] read {:.0} MB from storage in {:.2} s; decrypted in {:.2} s; engine waited {:.2} s for data",
@@ -373,6 +397,43 @@ fn cmd_seal(args: &Args) {
         let sealed = SealedSource::open(&out, key2, OpenOptions::default()).unwrap_or_else(|e| die(e));
         seal::verify_same(&src, &sealed).unwrap_or_else(|e| die(format!("self-check failed: {e}")));
         println!("[ok] self-check: decrypting the new file gives exactly the original weights.");
+    }
+}
+
+/// The file the weights are read from, for the file-cache probe.
+fn weights_path(args: &Args) -> PathBuf {
+    match (args.str("sealed"), args.str("quantized")) {
+        (Some(p), _) | (None, Some(p)) => PathBuf::from(p),
+        (None, None) => args.model_dir().join("model.safetensors"),
+    }
+}
+
+fn cmd_cache(args: &Args) {
+    let Some(path) = args.positional.first() else { usage() };
+    let show = |label: &str| match sys::file_cache_bytes(Path::new(path)) {
+        Ok((cached, total)) => println!(
+            "{label}: {:.0} of {:.0} MB of {path} are in the OS file cache ({:.0}%)",
+            mb(cached),
+            mb(total),
+            if total > 0 { 100.0 * cached as f64 / total as f64 } else { 0.0 }
+        ),
+        Err(e) => die(e),
+    };
+    show("before");
+    if args.has("read") {
+        let t = Instant::now();
+        let mut f = std::fs::File::open(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
+        let mut buf = vec![0u8; 1 << 20];
+        let mut total = 0u64;
+        loop {
+            match std::io::Read::read(&mut f, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => total += n as u64,
+                Err(e) => die(e),
+            }
+        }
+        println!("read {:.0} MB in {:.2} s", mb(total), t.elapsed().as_secs_f64());
+        show("after");
     }
 }
 
@@ -479,6 +540,9 @@ struct Run {
     wait_s: f64,
     decrypt_s: f64,
     new_tokens: usize,
+    /// Megabytes of the weights file in the OS cache before and after the run.
+    cache_before_mb: f64,
+    cache_after_mb: f64,
     ids: Vec<u32>,
 }
 
@@ -501,6 +565,8 @@ fn parse_result(stdout: &str) -> Option<Run> {
         wait_s: f("wait_s")?,
         decrypt_s: f("decrypt_s")?,
         new_tokens: f("new_tokens")? as usize,
+        cache_before_mb: f("cache_before")? / (1024.0 * 1024.0),
+        cache_after_mb: f("cache_after")? / (1024.0 * 1024.0),
         ids: get("ids")?.split(',').filter_map(|s| s.parse().ok()).collect(),
     })
 }
@@ -616,10 +682,10 @@ fn cmd_bench(args: &Args) {
     };
     let (ref_plain, ref_quant) = (reference_for(false), reference_for(true));
     println!(
-        "\n{:<48} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9}  identical",
-        "configuration", "peak MB", "model MB", "load s", "tokens/s", "read MB/tok", "wait s"
+        "\n{:<48} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9} {:>13}  identical",
+        "configuration", "peak MB", "model MB", "load s", "tokens/s", "read MB/tok", "wait s", "OS cache MB"
     );
-    println!("{}", "-".repeat(122));
+    println!("{}", "-".repeat(136));
     for (label, run) in &results {
         let Some(r) = run else {
             println!("{label:<48} (failed)");
@@ -630,19 +696,26 @@ fn cmd_bench(args: &Args) {
         let same = reference.as_ref().is_some_and(|ref_ids| ref_ids[..n] == r.ids[..n]);
         let read = if r.per_token_mb > 0.0 { format!("{:.0}", r.per_token_mb) } else { "-".into() };
         println!(
-            "{label:<48} {:>9.0} {:>9.0} {:>9.2} {:>9.1} {:>10} {:>9.2}  {}",
+            "{label:<48} {:>9.0} {:>9.0} {:>9.2} {:>9.1} {:>10} {:>9.2} {:>13}  {}",
             mb(r.peak as u64),
             mb((r.peak - r.tokenizer).max(0.0) as u64),
             r.load_s,
             r.tok_s,
             read,
             r.wait_s,
+            format!("{:.0} > {:.0}", r.cache_before_mb, r.cache_after_mb),
             if same { format!("yes ({n} tokens)") } else { "NO".to_string() }
         );
         let _ = (r.first_s, r.decrypt_s, r.new_tokens);
     }
     println!("\nidentical: same tokens as the first run of its kind. Quantized models are different models from the bf16 one,");
     println!("so they are compared with each other, not with the bf16 runs.");
+    println!("OS cache MB: how much of the weights file the operating system held in its file cache before > after the run.");
+    println!("That memory is real RAM but is not part of peak MB, and the system may drop it at any time; a run that starts");
+    println!("at 0 reads from storage the first time it needs each layer.");
+    if let Some(m) = sys::memory_state() {
+        println!("system memory now: {}% free, pressure {}.", m.free_percent, m.pressure_name());
+    }
     println!("peak MB: whole process. model MB: peak minus the tokenizer's own footprint.");
     println!("tokens/s: generation after the first token. wait s: time the engine stalled waiting for weights.");
 }
@@ -658,6 +731,7 @@ fn main() {
         "gen-key" => cmd_gen_key(&args),
         "seal" => cmd_seal(&args),
         "quantize" => cmd_quantize(&args),
+        "cache" => cmd_cache(&args),
         "eval" => cmd_eval(&args),
         "bench" => cmd_bench(&args),
         _ => usage(),

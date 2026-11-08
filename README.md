@@ -75,7 +75,47 @@ What it says:
   larger models of the same architecture, but I have not run one. Models with a separate output
   matrix (untied embeddings) are not supported yet.
 - **Peak memory** is the whole process (it includes a 14 MB tokenizer and the key/value cache
-  pages actually used), measured with `getrusage`.
+  pages actually used), measured with `getrusage`. It does not include the operating system's
+  file cache; see [Memory accounting](#memory-accounting-the-process-is-not-the-whole-machine).
+
+## Memory accounting: the process is not the whole machine
+
+The "peak memory" in the tables is the program's own peak resident memory. It does not include
+the operating system's **file cache**: when a program reads a file, the system keeps the pages
+in RAM so the next read is fast. That memory belongs to the system and can be dropped at any
+time, but while it is held, the machine is using it. So a streamed run touches more RAM than
+its peak says, whenever the system has room to cache the weights.
+
+Every run now reports this. `generate` prints how much of the weights file the system held in
+its cache before and after the run, plus the system's free-memory percentage and pressure level
+(macOS); `bench` has an "OS cache MB" column; `layerstream cache FILE [--read]` measures any
+file. The probe was checked against files whose state is known: a large file nobody had read
+reported 0% cached, and the same file reported 100% right after it was read.
+
+| Mode | Process peak | Weights file in the OS cache after the run | Process + cache |
+|---|---:|---:|---:|
+| bf16, everything in memory | 962 MB | 942 MB | about 1,900 MB (the model is held twice) |
+| bf16, streamed | 76 MB | 942 MB | about 1,020 MB |
+| int8, streamed | 49 MB | 486 MB | about 535 MB |
+| int4, streamed | 36 MB | 295 MB | about 330 MB |
+
+What this means:
+
+- **The process numbers are right, but they are not "the memory a device needs".** Streaming
+  keeps the program at 76 MB (49 MB, 36 MB). It does not stop the system from also holding the
+  file in its cache when it has the room.
+- **On a device with little RAM the cache cannot hold the file.** Reads then come from flash, so
+  the "file cached" speed rows do not apply and the capped-storage rows are the relevant ones.
+  Streaming still works there, with that small process footprint.
+- **The cache is not dependable on a busy machine.** When I started the last benchmark none of
+  the weights files were in the cache (0 MB), although I had run them hours earlier: this Mac
+  was under memory pressure (about 45% free, heavy swap use) and had dropped them. The first
+  run of each file read it from storage (about 3 GB/s here) and left it cached for the runs
+  after it. Most streamed rows ran with a warm cache because a run that loads everything comes
+  first; the "OS cache MB" column shows which rows did not.
+- **What I could not do.** Clearing the cache needs administrator rights, and macOS has no way
+  to cap the total memory of one program, so I could not run a truly cold or RAM-limited test.
+  A Linux cgroup memory limit with the cache dropped would be the proper test.
 
 ## Quantization: fewer bytes per token
 
@@ -96,11 +136,16 @@ configuration in a fresh process (`layerstream bench --quantized ...`).
 | Weights | File (= read per token) | Peak memory, streamed | Tokens/s, file cached | Tokens/s, storage capped at 2,000 MB/s | Tokens/s, capped at 500 MB/s | Tokens/s, encrypted and streamed |
 |---|---:|---:|---:|---:|---:|---:|
 | bf16 (as shipped) | 942 MB | 76 MB | 13 | 2.0 | 0.5 | 2.8 |
-| int8, groups of 64 | 486 MB | 49 MB | 26.7 | 3.9 | 1.0 | 5.2 |
-| int4, groups of 16 | 295 MB | 36 MB | 41.2 | 6.5 | 1.6 | 8.2 |
+| int8, groups of 64 | 486 MB | 49 MB | 25 | 3.9 | 1.0 | 5.2 |
+| int4, groups of 16 | 295 MB | 36 MB | 41 | 6.5 | 1.6 | 8.2 |
 
-Everything held in memory instead of streamed: 962 MB at 33 tokens/s (bf16), 505 MB at 63
+Everything held in memory instead of streamed: 962 MB at 33 tokens/s (bf16), 505 MB at 61 to 63
 tokens/s (int8), 314 MB at 49 tokens/s (int4).
+
+Run to run, the cached streaming speeds varied by about 10% (int8: 24 to 27 tokens/s over seven
+runs; int4: 41 to 42 over four; bf16: 12 to 13.6). One early benchmark run, which started with
+every weights file cold on a machine under memory pressure, came out two to three times slower
+on several streamed rows; running the same benchmark again gave the numbers above.
 
 **Quality.** Perplexity (lower is better) and agreement with the bf16 model, scoring 512 tokens
 of two texts token by token: frozen copies of this README ("prose") and of `src/model.rs`
@@ -132,7 +177,7 @@ What it says:
   here. Use 8-bit; 4-bit is for when memory or storage leaves no choice.
 - **Speed follows bytes while storage is the limit.** Capped at 500 MB/s, int8 (1.94x fewer
   bytes) runs 2x faster and int4 (3.2x fewer) 3.2x faster. With the file cached the gains are
-  2x and 3.2x too.
+  about 2x and 3.2x too.
 - **4-bit is not faster when everything is in memory.** Unpacking nibbles costs compute, so
   int4 resident (49 tokens/s) is slower than int8 resident (63). It only wins when bytes are the
   limit, which is the streaming case.
@@ -201,7 +246,7 @@ the costs.
   sizes and a different format for the embedding table. All streaming and encrypted modes of a
   quantized model give bit-for-bit identical logits. Deliberately breaking the 4-bit nibble order
   or the embedding format makes these tests fail.
-- 64 tests (`cargo test --release`). 15 of them run a whole synthetic model, so they need no
+- 67 tests (`cargo test --release`). 15 of them run a whole synthetic model, so they need no
   download; the tests that use the real model skip themselves loudly if it is absent.
 
 ## Encryption at rest (optional)
@@ -294,7 +339,8 @@ Kept here because they are the kind of mistake worth checking for:
 | `src/source.rs`, `src/seal.rs` | where bytes come from: plain file, or encrypted file |
 | `src/provider.rs` | resident vs streaming (with read-ahead) |
 | `src/model.rs`, `src/kernels.rs`, `src/pool.rs` | transformer, numeric kernels, thread pool |
-| `src/main.rs` | command line (`generate`, `bench`, `quantize`, `eval`, `seal`, `gen-key`, `tokenize`) |
+| `src/main.rs` | command line (`generate`, `bench`, `quantize`, `eval`, `cache`, `seal`, `gen-key`, `tokenize`) |
+| `src/sys.rs` | peak memory, OS file-cache and memory-pressure probes, buffer wiping |
 | `tests/` | reference comparison, synthetic-model pipeline and quantization tests, `golden.json` |
 | `scripts/` | `reference.py` (ground truth from Hugging Face), `verify_sealed.py`, `quant_eval.sh` (quality of each quantized variant) |
 
