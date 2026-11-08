@@ -5,6 +5,7 @@ use layerstream::source::{FileSource, Source, Throttle};
 use layerstream::sys;
 use layerstream::tokenizer::{StreamDecoder, Tokenizer};
 use layerstream::quant;
+use layerstream::spec;
 use layerstream::weights::{ModelFiles, QuantHeader, WeightFormat};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -30,6 +31,9 @@ USAGE
   layerstream quantize --model DIR --out FILE [--bits 8|4] [--group N] [--rtn]
                                                    store the weights as 8- or 4-bit integers
   layerstream eval     --model DIR --text FILE [options]   perplexity of the model on a text file
+  layerstream speculate --model DIR --draft FILE [--k N] [options]
+                       like generate, but a small in-memory model guesses several tokens and the big
+                       (streamed) model checks them in one pass; the words are exactly generate's
   layerstream tokenize --model DIR                 print token ids for each line on stdin
   layerstream cache    FILE [--read]               how much of FILE the OS holds in its file cache
                                                    (--read reads it all first and measures again)
@@ -58,6 +62,12 @@ QUANTIZE OPTIONS
                        for 8 bits, 32 for 4 bits)   --rtn   plain rounding instead of clip search
   --embed-bits N --embed-group N   a different format for the embedding table / output layer
                        (default: same as the layers)
+
+SPECULATE OPTIONS
+  --draft FILE         the guessing model: a file made by `quantize`, kept in memory
+  --k N                guesses per pass over the big model's weights (default 4, at most 32)
+                       (the big model is chosen with the usual --quantized / --sealed / --mode /
+                       --throttle-mbps options; greedy decoding only)
 
 EVAL OPTIONS
   --text FILE          text to score, token by token   --max-tokens N   (default 512)
@@ -317,6 +327,70 @@ fn cmd_generate(args: &Args) {
             );
         }
     }
+}
+
+/// The small guessing model for `speculate`: a quantized file loaded fully into memory.
+fn build_draft(args: &Args, threads: usize, max_ctx: usize) -> Model {
+    let path = args.str("draft").unwrap_or_else(|| die("--draft FILE is required (a file made by `quantize`)"));
+    let files = ModelFiles::open_quantized(Path::new(path)).unwrap_or_else(|e| die(e));
+    let source: Arc<dyn Source> = Arc::new(FileSource::open(files).unwrap_or_else(|e| die(e)));
+    let provider = ResidentProvider::load(source).unwrap_or_else(|e| die(e));
+    Model::new(Box::new(provider), threads, max_ctx)
+}
+
+fn cmd_speculate(args: &Args) {
+    let tok = Tokenizer::load(&args.model_dir()).unwrap_or_else(|e| die(e));
+    let user = args.str("prompt").unwrap_or(DEFAULT_PROMPT);
+    let text = if args.has("raw") { user.to_string() } else { chat_prompt(args.str("system").unwrap_or(DEFAULT_SYSTEM), user) };
+    let prompt_ids = tok.encode(&text);
+    let max_new: usize = args.num("max-new", 64);
+    let k: usize = args.num("k", 4);
+    let report = args.has("report");
+    let threads: usize = args.num("threads", default_threads());
+    let max_ctx: usize = args.num("max-ctx", 1024);
+
+    let Built { mut model, label, .. } = build(args, "stream");
+    let mut draft = build_draft(args, threads, max_ctx);
+    let draft_bytes = draft.report().resident_weight_bytes;
+    let res = spec::speculative_greedy(&mut model, &mut draft, &prompt_ids, max_new, k, &EOS).unwrap_or_else(|e| die(e));
+    let peak = sys::peak_rss_bytes();
+    let st = &res.stats;
+    let new_after_first = res.tokens.len().saturating_sub(1);
+    let tok_s = if res.decode_secs > 0.0 { new_after_first as f64 / res.decode_secs } else { 0.0 };
+
+    if report {
+        let ids: Vec<String> = res.tokens.iter().map(u32::to_string).collect();
+        println!(
+            "SPEC_RESULT peak_rss={} k={k} first_s={:.4} decode_s={:.4} new_tokens={} passes={} drafted={} accepted={} draft_forwards={} target_s={:.4} draft_s={:.4} draft_bytes={} ids={}",
+            peak,
+            res.first_secs,
+            res.decode_secs,
+            res.tokens.len(),
+            st.target_passes,
+            st.drafted,
+            st.accepted,
+            st.draft_forwards,
+            st.target_secs,
+            st.draft_secs,
+            draft_bytes,
+            ids.join(",")
+        );
+        return;
+    }
+    let mut dec = StreamDecoder::default();
+    for &t in &res.tokens {
+        print!("{}", dec.push(&tok.token_bytes(t, false)));
+    }
+    println!("{}", dec.finish());
+    let per_pass = if st.target_passes > 0 { new_after_first as f64 / st.target_passes as f64 } else { 0.0 };
+    let rate = if st.drafted > 0 { 100.0 * st.accepted as f64 / st.drafted as f64 } else { 0.0 };
+    eprintln!("\n[layerstream] speculative decoding, k = {k}: big model {label}; draft model held in memory ({:.0} MB)", mb(draft_bytes));
+    eprintln!("[layerstream] {} tokens after the first in {:.2} s = {tok_s:.1} tokens/s", new_after_first, res.decode_secs);
+    eprintln!(
+        "[layerstream] {} passes over the big model's weights ({per_pass:.2} tokens per pass); the draft guessed {} of {} right ({rate:.0}%)",
+        st.target_passes, st.accepted, st.drafted
+    );
+    eprintln!("[layerstream] time in the big model {:.2} s, in the draft {:.2} s; peak memory {:.0} MB", st.target_secs, st.draft_secs, mb(peak));
 }
 
 fn cmd_tokenize(args: &Args) {
@@ -731,6 +805,7 @@ fn main() {
         "gen-key" => cmd_gen_key(&args),
         "seal" => cmd_seal(&args),
         "quantize" => cmd_quantize(&args),
+        "speculate" => cmd_speculate(&args),
         "cache" => cmd_cache(&args),
         "eval" => cmd_eval(&args),
         "bench" => cmd_bench(&args),

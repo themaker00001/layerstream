@@ -199,6 +199,75 @@ differences below about 0.1 are noise; one 0.5B model; and this is plain weight 
 no calibration data, which is why 4-bit loses what it does (methods such as GPTQ or AWQ keep
 more at 4 bits).
 
+## Speculative decoding: more tokens per pass over the weights
+
+The limit on a streamed model is that every token needs a full pass over the weights. Speculative
+decoding attacks that directly: a small *draft* model, kept in memory, guesses the next few
+tokens, and the big model checks all of the guesses in a single pass. Guesses that match what the
+big model would have chosen are kept, so one pass can yield several tokens. The result is
+exactly what the big model alone would produce with greedy decoding, whatever the draft guesses;
+a wrong guess only costs time.
+
+```text
+$ layerstream speculate --model models/Qwen2.5-0.5B-Instruct --draft models/int8.lsq --k 4 --throttle-mbps 500 --max-new 48 --prompt "Explain what a CPU does in two sentences."
+A CPU (Central Processing Unit) is the brain of a computer, responsible for executing instructions and performing calculations. It processes data, manages memory, and controls the flow of operations within the computer system.
+
+[layerstream] speculative decoding, k = 4: big model stream, 2 slots (plain file, storage capped at 500 MB/s); draft model held in memory (486 MB)
+[layerstream] 40 tokens after the first in 18.66 s = 2.1 tokens/s
+[layerstream] 9 passes over the big model's weights (4.44 tokens per pass); the draft guessed 35 of 36 right (97%)
+[layerstream] time in the big model 17.79 s, in the draft 0.84 s; peak memory 573 MB
+```
+
+That is 2.1 tokens/s at a 500 MB/s cap, against 0.5 without speculation, with the same answer.
+
+Here the draft is an 8-bit or 4-bit copy of the same 0.5B model, because that is what I had on
+disk. Results for a streamed bf16 model and a streamed int8 model (`scripts/spec_bench.py`, every
+configuration in a fresh process; 4 prompts of 48 tokens, 3 of 24 at 500 MB/s):
+
+| Big model | Storage | Draft in memory | Guesses per pass | Tokens/s | Speedup | Tokens per pass | Guesses right | Peak memory |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| bf16 | file cached | none | - | 12.7 | 1.0x | 1.0 | - | 77 MB |
+| bf16 | file cached | int8 copy | 4 | 20.4 | 1.6x | 4.6 | 97% | 571 MB |
+| bf16 | capped 2,000 MB/s | none | - | 2.0 | 1.0x | 1.0 | - | 78 MB |
+| bf16 | capped 2,000 MB/s | int8 copy | 4 | 8.0 | 4.0x | 4.6 | 97% | 573 MB |
+| bf16 | capped 2,000 MB/s | int8 copy | 8 | 12.5 | 6.1x | 7.9 | 97% | 576 MB |
+| bf16 | capped 500 MB/s | none | - | 0.51 | 1.0x | 1.0 | - | 77 MB |
+| bf16 | capped 500 MB/s | int8 copy | 4 | 2.2 | 4.4x | 4.6 | 100% | 574 MB |
+| bf16 | capped 500 MB/s | int8 copy | 8 | 3.6 | 7.1x | 7.7 | 100% | 577 MB |
+| bf16 | capped 500 MB/s | int4 copy | 4 | 1.9 | 3.8x | 4.1 | 84% | 380 MB |
+| int8 | capped 500 MB/s | none | - | 0.98 | 1.0x | 1.0 | - | 50 MB |
+| int8 | capped 500 MB/s | int4 copy | 4 | 3.6 | 3.7x | 4.1 | 84% | 354 MB |
+| int8 | file cached | none | - | 26.4 | 1.0x | 1.0 | - | 49 MB |
+| int8 | file cached | int4 copy | 4 | 25.2 | 0.95x | 3.8 | 75% | 352 MB |
+
+What it says:
+
+- **Same words, every time.** All of the runs above produced exactly the tokens that plain greedy
+  decoding of the same big model produced. The tests check this with a good draft, a poor draft
+  and an unrelated model as the draft, and they fail if the cache rollback, the acceptance check
+  or the draft's re-sync is deliberately broken.
+- **When storage is the limit, it is a large win.** A pass costs the same whether it checks one
+  token or nine, so speed follows tokens per pass: 4 to 7 times faster at 2,000 and 500 MB/s.
+- **When the file is cached, the win is small.** Checking several tokens in one pass costs more
+  compute than checking one, and with fast reads that compute is no longer hidden behind waiting
+  for storage: 1.6x for the bf16 model, and a slight loss (0.95x) for the int8 one.
+- **The price is memory, and on this model it cancels the point of streaming.** The draft has to
+  stay in memory, and here it is bigger than the whole streaming footprint: the peak goes from
+  77 MB to about 570 MB with an int8 draft and 380 MB with an int4 draft. Speculation only makes
+  sense when the big model is far larger than its draft (say a multi-billion-parameter model
+  streamed with a draft of a few hundred MB). I did not test that, because I did not download a
+  larger model.
+- **The draft here is unusually good.** It is a rounded copy of the big model itself, so it agrees
+  97 to 100% of the time (int8) or 72 to 84% (int4). A separate small model would agree less, and
+  the gains would be smaller than in this table.
+
+Caveats: one machine, a small sample (4 prompts), emulated slow storage, greedy decoding only, and
+by the end of the run the operating system had dropped the bf16 weights from its cache (the
+machine was under memory pressure), so the "file cached" rows are only as cached as the first
+few minutes of the run. Speculative decoding is a published technique (Leviathan et al. and
+Chen et al., 2023). I have not searched for earlier work that combines it with streaming weights
+from storage, so I make no claim that this combination is new.
+
 ## This is not a new idea
 
 Streaming layers from disk is what llama.cpp's memory mapping, AirLLM, FlexGen and Hugging
@@ -246,7 +315,11 @@ the costs.
   sizes and a different format for the embedding table. All streaming and encrypted modes of a
   quantized model give bit-for-bit identical logits. Deliberately breaking the 4-bit nibble order
   or the embedding format makes these tests fail.
-- 67 tests (`cargo test --release`). 15 of them run a whole synthetic model, so they need no
+- Speculative decoding produces exactly the tokens of plain greedy decoding, whichever draft is
+  used (a good one, a poor one, an unrelated model), and its batched check of several positions
+  gives logits bit-identical to one-token passes. Deliberately breaking the cache rollback, the
+  acceptance check or the draft's re-sync makes the tests fail.
+- 73 tests (`cargo test --release`). 21 of them run a whole synthetic model, so they need no
   download; the tests that use the real model skip themselves loudly if it is absent.
 
 ## Encryption at rest (optional)
@@ -296,6 +369,10 @@ M=models/Qwen2.5-0.5B-Instruct
 ./target/release/layerstream bench --model $M --sealed models/qwen.sealed --key-file models/my.key \
     --quantized models/int8.lsq --quantized-sealed models/int8.sealed
 scripts/quant_eval.sh $M          # perplexity and answer agreement for every quantized variant
+
+# 6. optional: speculative decoding (a small in-memory copy guesses, the big model checks)
+./target/release/layerstream speculate --model $M --draft models/int8.lsq --k 4 --throttle-mbps 500
+scripts/spec_bench.py $M          # every run is checked against plain decoding
 ```
 
 The reference scripts need Python with `torch` and `transformers` (`scripts/reference.py`, which
@@ -311,7 +388,8 @@ build or run the Rust program.
 - Tokenizer: Unicode letter and number classes use Rust's `is_alphabetic` and `is_numeric`, and
   text is not NFC-normalised first. It matched the reference on everything tested.
 - Greedy decoding is the default and the one that was verified; temperature, top-k and top-p
-  sampling exist and are unit-tested but were not compared against the reference.
+  sampling exist and are unit-tested but were not compared against the reference. Speculative
+  decoding supports greedy decoding only.
 - The key/value cache is f32 and reserved up front (24 MB at the default 1,024-token context);
   only the pages actually used count towards resident memory.
 - Unix only (positioned reads, `getrusage`).
@@ -336,13 +414,14 @@ Kept here because they are the kind of mistake worth checking for:
 | `src/tokenizer.rs` | Qwen2 byte-level BPE |
 | `src/weights.rs` | config, weight formats, and the layout of a layer's 12 tensors |
 | `src/quant.rs` | the quantizer: bf16 model to 8-bit / 4-bit file |
+| `src/spec.rs` | speculative decoding: a small model guesses, the big one checks |
 | `src/source.rs`, `src/seal.rs` | where bytes come from: plain file, or encrypted file |
 | `src/provider.rs` | resident vs streaming (with read-ahead) |
 | `src/model.rs`, `src/kernels.rs`, `src/pool.rs` | transformer, numeric kernels, thread pool |
 | `src/main.rs` | command line (`generate`, `bench`, `quantize`, `eval`, `cache`, `seal`, `gen-key`, `tokenize`) |
 | `src/sys.rs` | peak memory, OS file-cache and memory-pressure probes, buffer wiping |
-| `tests/` | reference comparison, synthetic-model pipeline and quantization tests, `golden.json` |
-| `scripts/` | `reference.py` (ground truth from Hugging Face), `verify_sealed.py`, `quant_eval.sh` (quality of each quantized variant) |
+| `tests/` | reference comparison, synthetic-model pipeline, quantization and speculative decoding tests, `golden.json` |
+| `scripts/` | `reference.py` (ground truth from Hugging Face), `verify_sealed.py`, `quant_eval.sh` (quality of each quantized variant), `spec_bench.py` (speculative decoding benchmark) |
 
 ## Licence
 

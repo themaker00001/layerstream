@@ -10,6 +10,7 @@ pub mod quant;
 pub mod safetensors;
 pub mod seal;
 pub mod source;
+pub mod spec;
 pub mod sys;
 pub mod tokenizer;
 pub mod weights;
